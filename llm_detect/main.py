@@ -42,11 +42,32 @@ from openai import OpenAI
 
 from robonix_api import ATLAS, Service, Ok, Err  # noqa: E402
 
+# ── logging setup ───────────────────────────────────────────────────────────
+# Use the same pattern as mid360_lidar_rbnx: simple basicConfig for stderr,
+# then manually add a FileHandler. Use force=True (Python 3.8+) to ensure
+# configuration takes effect even if robonix_api already configured the
+# root logger during import.
+_LOG_DIR = Path(os.environ.get(
+    "LLM_DETECT_LOG_DIR",
+    os.path.join(Path.home(), ".llm_detect", "logs"),
+))
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_FILE = _LOG_DIR / "llm_detect.log"
+
 logging.basicConfig(
     level=os.environ.get("LLM_DETECT_LOG_LEVEL", "INFO"),
     format="[llm_detect] %(message)s",
+    force=True,
 )
 log = logging.getLogger("llm_detect")
+# Add file handler explicitly (append mode).
+_file_handler = logging.FileHandler(str(_LOG_FILE), mode="a")
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(logging.Formatter(
+    "[llm_detect] %(asctime)s %(levelname)s %(message)s"
+))
+log.addHandler(_file_handler)
+log.info("log file: %s", _LOG_FILE)
 
 # Provider id MUST match the deploy manifest's `service: - name: ...`.
 llm_detect = Service(
