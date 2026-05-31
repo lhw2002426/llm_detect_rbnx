@@ -2,7 +2,9 @@
 # Single object detection prompt — used when a specific object_name is given.
 # The LLM is asked to find the target object AND list other detectable
 # objects in the scene, so we can see what's in the frame even when the
-# target is not found.
+# target is not found.  Each detected object also carries a similarity
+# score against the requested target name to enable fuzzy matching on the
+# Python side (e.g. "white box" should match "white rectangular package").
 single_detect_prompt = """
 You are a high-precision machine vision object detection expert. Analyze the given image and detect objects in the scene.
 
@@ -12,48 +14,74 @@ Your task:
 1. Detect the primary target object "{object_name}" if present.
 2. ALSO detect up to 5 other prominent objects visible in the image (background context). Include them even if the target object is found.
 3. Always return at least the objects you can see, even if "{object_name}" is not present.
+4. For EVERY detected object, also assign a "target_match_score" (float in [0,1], 2 decimals) that estimates how well this object semantically matches the requested target name "{object_name}". Use the scale below.
+
+target_match_score scale (BE GENEROUS — partial / fuzzy matches are valuable):
+  1.00  exact match           (e.g. target="cup",        object="cup")
+  0.85-0.99  strong synonym/superset
+                              (e.g. target="white box",  object="white rectangular package")
+                              (e.g. target="cup",        object="white mug")
+  0.60-0.84  partial / generic match
+                              (e.g. target="box",        object="cardboard package")
+                              (e.g. target="bottle",     object="cylindrical container")
+  0.30-0.59  weakly related   (same broad category but clearly different specific item)
+  0.00-0.29  unrelated
 
 Output a pure JSON object (no markdown, no code fences, no extra text) with this schema:
 {
   "target_found": boolean,
-  "target_index": integer,         // index into "objects" array of the target match, or -1 if not found
+  "target_index": integer,         // index into "objects" array of the BEST target match, or -1 if none reaches 0.85
   "objects": [
     {
-      "class_name": "string",      // object name; use the target name for the matched target
-      "box_center_x": float,        // 0-1, 3 decimals
-      "box_center_y": float,        // 0-1, 3 decimals
-      "box_width":   float,        // 0-1, 3 decimals
-      "box_height":  float,        // 0-1, 3 decimals
-      "is_target":   boolean       // true ONLY for the matched target object
+      "class_name": "string",         // object name; use the target name for the matched target
+      "box_center_x": float,           // 0-1, 3 decimals (NORMALIZED, never pixels)
+      "box_center_y": float,           // 0-1, 3 decimals (NORMALIZED, never pixels)
+      "box_width":   float,           // 0-1, 3 decimals
+      "box_height":  float,           // 0-1, 3 decimals
+      "is_target":   boolean,         // true ONLY for the matched target object
+      "target_match_score": float     // 0-1, 2 decimals, similarity to "{object_name}" per scale above
     }
   ]
 }
 
-Coordinate system: top-left corner is (0,0), x-axis goes right, y-axis goes down. All coordinates are normalized (0-1).
+Coordinate system: top-left corner is (0,0), x-axis goes right, y-axis goes down. ALL coordinates MUST be normalized to [0,1] — NEVER output raw pixel values.
 
 Rules:
-- If the target object is found: set target_found=true, target_index to its index in "objects", and is_target=true on that one entry.
-- If the target object is NOT found: set target_found=false, target_index=-1, but still return all other detected objects so the caller can see what IS in the frame.
+- If any object reaches target_match_score >= 0.85: pick the highest-scoring one as the target. Set target_found=true, target_index to its index, and is_target=true on that one entry.
+- If the best score is in [0.60, 0.85): set target_found=false and target_index=-1 (let the caller decide whether to accept the fuzzy match), but still fill target_match_score honestly so the caller can fuzzy-match.
+- If no object exceeds 0.60: set target_found=false, target_index=-1, is_target=false on all, but still return all detected objects.
 - Always return at least one object in "objects" if the image contains any recognizable items. Only return an empty list if the image is truly empty/blank.
 
-Example (target found):
+Example (strong match — target found):
 {
   "target_found": true,
   "target_index": 0,
   "objects": [
-    {"class_name": "red cup",  "box_center_x": 0.512, "box_center_y": 0.334, "box_width": 0.145, "box_height": 0.210, "is_target": true},
-    {"class_name": "keyboard", "box_center_x": 0.500, "box_center_y": 0.800, "box_width": 0.600, "box_height": 0.180, "is_target": false},
-    {"class_name": "monitor",  "box_center_x": 0.500, "box_center_y": 0.300, "box_width": 0.700, "box_height": 0.500, "is_target": false}
+    {"class_name": "red cup",  "box_center_x": 0.512, "box_center_y": 0.334, "box_width": 0.145, "box_height": 0.210, "is_target": true,  "target_match_score": 0.95},
+    {"class_name": "keyboard", "box_center_x": 0.500, "box_center_y": 0.800, "box_width": 0.600, "box_height": 0.180, "is_target": false, "target_match_score": 0.05},
+    {"class_name": "monitor",  "box_center_x": 0.500, "box_center_y": 0.300, "box_width": 0.700, "box_height": 0.500, "is_target": false, "target_match_score": 0.02}
   ]
 }
 
-Example (target NOT found, but other objects visible):
+Example (fuzzy match — caller may still accept it):
+target = "white box"
 {
   "target_found": false,
   "target_index": -1,
   "objects": [
-    {"class_name": "keyboard", "box_center_x": 0.500, "box_center_y": 0.800, "box_width": 0.600, "box_height": 0.180, "is_target": false},
-    {"class_name": "book",     "box_center_x": 0.300, "box_center_y": 0.400, "box_width": 0.200, "box_height": 0.250, "is_target": false}
+    {"class_name": "white rectangular package", "box_center_x": 0.407, "box_center_y": 0.540, "box_width": 0.088, "box_height": 0.570, "is_target": false, "target_match_score": 0.82},
+    {"class_name": "small box",                  "box_center_x": 0.045, "box_center_y": 0.628, "box_width": 0.088, "box_height": 0.237, "is_target": false, "target_match_score": 0.55},
+    {"class_name": "black monitor frame",        "box_center_x": 0.500, "box_center_y": 0.100, "box_width": 1.000, "box_height": 0.200, "is_target": false, "target_match_score": 0.03}
+  ]
+}
+
+Example (target NOT found, only unrelated objects):
+{
+  "target_found": false,
+  "target_index": -1,
+  "objects": [
+    {"class_name": "keyboard", "box_center_x": 0.500, "box_center_y": 0.800, "box_width": 0.600, "box_height": 0.180, "is_target": false, "target_match_score": 0.04},
+    {"class_name": "book",     "box_center_x": 0.300, "box_center_y": 0.400, "box_width": 0.200, "box_height": 0.250, "is_target": false, "target_match_score": 0.10}
   ]
 }
 """

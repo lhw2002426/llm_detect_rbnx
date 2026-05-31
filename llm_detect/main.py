@@ -338,6 +338,9 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
                 target_index = 0
 
     # Validate + normalise each object.
+    # If LLM returns out-of-range coords (e.g. raw pixel values like 628 instead
+    # of 0.628), the object is BAD and we drop it — clamping silently produces
+    # a bbox at the image border which is misleading.
     parsed_objects = []
     for i, obj in enumerate(objects_raw):
         try:
@@ -346,81 +349,151 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
             w  = float(obj["box_width"])
             h  = float(obj["box_height"])
         except (KeyError, TypeError, ValueError) as e:
-            log.warning("object[%d] has invalid bbox fields, skipping: %s", i, e)
+            log.warning("object[%d] has invalid bbox fields, skipping: %s (raw=%s)",
+                        i, e, obj)
             continue
-        # Clamp to [0,1] but keep them; we still want to draw what LLM saw.
-        cx_c, cy_c = max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy))
-        w_c,  h_c  = max(0.0, min(1.0, w)),  max(0.0, min(1.0, h))
-        if (cx, cy, w, h) != (cx_c, cy_c, w_c, h_c):
-            log.warning("object[%d] bbox clamped: (%.3f,%.3f,%.3f,%.3f) -> (%.3f,%.3f,%.3f,%.3f)",
-                        i, cx, cy, w, h, cx_c, cy_c, w_c, h_c)
+        # Read fuzzy-match score (added by new prompt). Tolerate missing/bad value.
+        try:
+            tms = float(obj.get("target_match_score", 0.0))
+        except (TypeError, ValueError):
+            tms = 0.0
+        tms = max(0.0, min(1.0, tms))
+        # Detect out-of-[0,1] coords (LLM occasionally outputs raw pixels) and
+        # drop the object — clamping a value like 628 to 1.0 would silently
+        # place the bbox at the image edge.
+        oob = [v for v in (cx, cy, w, h) if not (0.0 <= v <= 1.0)]
+        if oob:
+            log.warning("object[%d] has out-of-range coords (cx=%.3f cy=%.3f w=%.3f h=%.3f); "
+                        "dropping (LLM likely returned raw pixels). class_name='%s'",
+                        i, cx, cy, w, h, obj.get("class_name", "?"))
+            continue
+        # Drop near-zero size boxes too.
+        if w <= 1e-3 or h <= 1e-3:
+            log.warning("object[%d] has degenerate size w=%.4f h=%.4f; dropping. class_name='%s'",
+                        i, w, h, obj.get("class_name", "?"))
+            continue
+        cx_c, cy_c, w_c, h_c = cx, cy, w, h
         # If rotation was applied, flip coordinates back.
         if _rotation_cam2arm:
             cx_c = 1.0 - cx_c
             cy_c = 1.0 - cy_c
         parsed_objects.append({
-            "class_name":   str(obj.get("class_name", "unknown")),
-            "box_center_x": cx_c,
-            "box_center_y": cy_c,
-            "box_width":    w_c,
-            "box_height":   h_c,
-            "is_target":    bool(obj.get("is_target", False)),
+            "class_name":         str(obj.get("class_name", "unknown")),
+            "box_center_x":       cx_c,
+            "box_center_y":       cy_c,
+            "box_width":          w_c,
+            "box_height":         h_c,
+            "is_target":          bool(obj.get("is_target", False)),
+            "target_match_score": tms,
         })
 
     log.info("parsed %d objects from LLM response (target_found=%s, target_index=%d)",
              len(parsed_objects), target_found, target_index)
+    for i, o in enumerate(parsed_objects):
+        log.info("  obj[%d] class='%s' is_target=%s target_match_score=%.2f bbox=(%.3f,%.3f,%.3f,%.3f)",
+                 i, o["class_name"], o["is_target"], o["target_match_score"],
+                 o["box_center_x"], o["box_center_y"], o["box_width"], o["box_height"])
 
-    # Locate target: prefer is_target flag, fall back to target_index.
+    # ── Locate target ───────────────────────────────────────────────────
+    # Strategy:
+    #   (1) Strict match: any object with is_target=true.
+    #   (2) target_index pointer (if valid).
+    #   (3) target_found + single object.
+    #   (4) Heuristic substring match on class_name (single-object case).
+    #   (5) Fuzzy match: highest target_match_score above FUZZY_THRESHOLD.
+    # Steps (1)-(4) yield a STRICT match (fuzzy_matched=False).
+    # Step (5) yields a FUZZY match (fuzzy_matched=True) and is logged loudly.
+    FUZZY_THRESHOLD = 0.60   # minimum score for fuzzy fallback acceptance
+
     target = None
     target_idx_in_parsed = -1
+    fuzzy_matched = False
+    match_reason = ""
+
+    # (1) is_target flag.
     for i, o in enumerate(parsed_objects):
         if o.get("is_target"):
             target = o
             target_idx_in_parsed = i
+            match_reason = "strict: is_target=true"
             break
+    # (2) target_index pointer.
     if target is None and 0 <= target_index < len(parsed_objects):
         target = parsed_objects[target_index]
         target_idx_in_parsed = target_index
         target["is_target"] = True
-    # If still not found but target_found is true and we only have 1 object,
-    # treat it as the target.
+        match_reason = f"strict: target_index={target_index}"
+    # (3) target_found + single object.
     if target is None and target_found and len(parsed_objects) == 1:
         target = parsed_objects[0]
         target_idx_in_parsed = 0
         target["is_target"] = True
-    # Last-resort heuristic: LLM did not flag any object as target, did not
-    # set target_found, but the response contains exactly one object whose
-    # class_name plausibly matches the requested object_name.  Treat it as
-    # the target so the caller is not surprised by a False success when
-    # the LLM clearly DID find the object.
+        match_reason = "strict: target_found=true with single object"
+    # (4) Heuristic substring match on class_name (single-object case).
     if target is None and len(parsed_objects) == 1:
         only = parsed_objects[0]
         only_name = str(only.get("class_name", "")).lower()
         wanted = object_name.lower()
         if (wanted in only_name) or (only_name in wanted) or (wanted == only_name):
-            log.info("heuristic match: single object class_name='%s' matches target '%s'",
-                     only_name, wanted)
             target = only
             target_idx_in_parsed = 0
             target["is_target"] = True
+            match_reason = (f"strict heuristic: single object class_name='{only_name}' "
+                            f"matches '{wanted}'")
+
+    # (5) Fuzzy match via target_match_score.
+    if target is None and parsed_objects:
+        # Sort candidates by score desc.
+        scored = sorted(
+            enumerate(parsed_objects),
+            key=lambda kv: kv[1].get("target_match_score", 0.0),
+            reverse=True,
+        )
+        log.info("[fuzzy] no strict target; candidates (sorted by score) for target='%s':",
+                 object_name)
+        for idx, o in scored:
+            log.info("  cand[%d] class='%s' score=%.2f",
+                     idx, o["class_name"], o.get("target_match_score", 0.0))
+        best_idx, best_obj = scored[0]
+        best_score = best_obj.get("target_match_score", 0.0)
+        if best_score >= FUZZY_THRESHOLD:
+            target = best_obj
+            target_idx_in_parsed = best_idx
+            target["is_target"] = True
+            fuzzy_matched = True
+            match_reason = (f"FUZZY: best score {best_score:.2f} >= threshold "
+                            f"{FUZZY_THRESHOLD:.2f}; class_name='{best_obj['class_name']}'")
+            log.info("[fuzzy] ACCEPTED: target='%s' -> '%s' (score=%.2f, threshold=%.2f)",
+                     object_name, best_obj["class_name"], best_score, FUZZY_THRESHOLD)
+        else:
+            log.info("[fuzzy] REJECTED: best candidate '%s' score=%.2f < threshold %.2f",
+                     best_obj["class_name"], best_score, FUZZY_THRESHOLD)
 
     other_objects = [o for i, o in enumerate(parsed_objects)
                      if i != target_idx_in_parsed]
 
     if target is None:
         return {
-            "success": False,
-            "message": (f"object '{object_name}' not found by LLM "
-                        f"(but {len(other_objects)} other objects detected)"),
-            "target": None,
-            "other_objects": other_objects,
+            "success":        False,
+            "message":        (f"object '{object_name}' not found by LLM "
+                                f"(but {len(other_objects)} other objects detected)"),
+            "target":         None,
+            "other_objects":  other_objects,
+            "fuzzy_matched":  False,
+            "match_reason":   "no target found",
         }
 
+    log.info("target locked: class='%s' score=%.2f reason=%s",
+             target["class_name"], target.get("target_match_score", 0.0),
+             match_reason)
+
     return {
-        "success": True,
-        "message": "",
-        "target": target,
-        "other_objects": other_objects,
+        "success":        True,
+        "message":        "",
+        "target":         target,
+        "other_objects":  other_objects,
+        "fuzzy_matched":  fuzzy_matched,
+        "match_reason":   match_reason,
     }
 
 
@@ -465,6 +538,12 @@ def _detect_object(object_name: str) -> dict:
 
     target = llm_result.get("target")
     other_objects = llm_result.get("other_objects", [])
+    fuzzy_matched = bool(llm_result.get("fuzzy_matched", False))
+    match_reason = llm_result.get("match_reason", "")
+    if fuzzy_matched and target is not None:
+        log.warning("[fuzzy] using FUZZY match for '%s' -> '%s' (score=%.2f); reason=%s",
+                    object_name, target.get("class_name", "?"),
+                    target.get("target_match_score", 0.0), match_reason)
 
     # Helper: convert a normalised obj dict to pixel bbox.
     def _obj_to_pixel_bbox(o):
@@ -513,12 +592,21 @@ def _detect_object(object_name: str) -> dict:
     log.info("confidence=%.3f (bbox_area=%d, img_area=%d)",
              confidence, bbox_area, img_area)
 
-    # 4. Save annotated image with target (green) + other objects (blue).
+    # 4. Save annotated image with target (green/yellow) + other objects (blue).
+    target_class = target.get("class_name", object_name)
+    target_score = float(target.get("target_match_score", 0.0))
+    if fuzzy_matched:
+        target_label = (f"{target_class} [FUZZY {target_score:.2f}] "
+                        f"req='{object_name}' ({confidence:.2f})")
+    else:
+        target_label = f"{target_class} ({confidence:.2f})"
     _save_detection_image(color_img, object_name,
                           target_bbox={
                               "bbox": [x_min, y_min, x_max, y_max],
-                              "class_name": target.get("class_name", object_name),
+                              "class_name": target_class,
                               "confidence": confidence,
+                              "label": target_label,
+                              "fuzzy": fuzzy_matched,
                           },
                           other_objects=[
                               {**o, "bbox": _obj_to_pixel_bbox(o)}
@@ -526,9 +614,15 @@ def _detect_object(object_name: str) -> dict:
                           ],
                           success=True)
 
+    if fuzzy_matched:
+        msg = (f"detected '{object_name}' via LLM (FUZZY match -> "
+               f"'{target_class}', score={target_score:.2f}, {elapsed:.2f}s)")
+    else:
+        msg = f"detected '{object_name}' via LLM ({elapsed:.2f}s)"
+
     return {
         "success":          True,
-        "message":          f"detected '{object_name}' via LLM ({elapsed:.2f}s)",
+        "message":          msg,
         "bbox_2d":          bbox,
         "object_center_3d": center_3d if center_3d is not None else [],
         "confidence":       float(confidence),
@@ -558,9 +652,10 @@ def _save_detection_image(image_bgr: np.ndarray, object_name: str,
     """Save an annotated detection image to disk for debugging.
 
     Always draws ALL detected objects so you can see what's in the frame:
-      - target (success):   GREEN box, label "<class> (conf)"
-      - target (failed):    none drawn (target not found)
-      - other_objects:      BLUE boxes, label "<class>"
+      - target (strict success):  GREEN box, label "<class> (conf)"
+      - target (FUZZY success):   YELLOW box, label "<class> [FUZZY <score>]"
+      - target (failed):          none drawn (target not found)
+      - other_objects:            BLUE boxes, label "<class> @<score>"
 
     Files use FIXED names (no timestamp) so each call overwrites:
       - latest_ok.jpg     when target was detected successfully
@@ -568,9 +663,11 @@ def _save_detection_image(image_bgr: np.ndarray, object_name: str,
       - latest.jpg        always (most recent regardless of outcome)
 
     other_objects: list of dicts each containing keys:
-      - "bbox":       [x_min, y_min, x_max, y_max] in pixels
-      - "class_name": string
-    target_bbox: dict with keys "bbox", "class_name", "confidence".
+      - "bbox":               [x_min, y_min, x_max, y_max] in pixels
+      - "class_name":         string
+      - "target_match_score": float (optional, drawn into label if present)
+    target_bbox: dict with keys "bbox", "class_name", "confidence", and
+      optional "label" (overrides default) and "fuzzy" (bool).
     """
     try:
         import cv2
@@ -582,15 +679,29 @@ def _save_detection_image(image_bgr: np.ndarray, object_name: str,
             bbox = o.get("bbox")
             if not bbox:
                 continue
-            label = str(o.get("class_name", "?"))
+            cls = str(o.get("class_name", "?"))
+            score = o.get("target_match_score")
+            if score is not None:
+                label = f"{cls} @{float(score):.2f}"
+            else:
+                label = cls
             _draw_one_box(img, bbox, label, color=(255, 128, 0), thickness=2)
 
-        # 2. Draw target on top.
+        # 2. Draw target on top. Yellow if fuzzy, green if strict.
         if success and target_bbox is not None:
-            label = (f"{target_bbox.get('class_name', object_name)} "
-                     f"({target_bbox.get('confidence', 0.0):.2f})")
+            is_fuzzy = bool(target_bbox.get("fuzzy", False))
+            target_color = (0, 255, 255) if is_fuzzy else (0, 255, 0)  # BGR
+            label = target_bbox.get("label") or (
+                f"{target_bbox.get('class_name', object_name)} "
+                f"({target_bbox.get('confidence', 0.0):.2f})"
+            )
             _draw_one_box(img, target_bbox["bbox"], label,
-                          color=(0, 255, 0), thickness=3)
+                          color=target_color, thickness=3)
+            # Overlay banner at top so the user immediately knows it was fuzzy.
+            if is_fuzzy:
+                cv2.putText(img, f"FUZZY MATCH: req='{object_name}'",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (0, 200, 255), 2, cv2.LINE_AA)
             filename = "latest_ok.jpg"
         else:
             # Target not found — annotate top of image with red FAILED text.
@@ -604,8 +715,13 @@ def _save_detection_image(image_bgr: np.ndarray, object_name: str,
         cv2.imwrite(str(filepath), img)
         # Also save a generic "latest" pointer that always reflects most recent.
         cv2.imwrite(str(_DETECTION_IMG_DIR / "latest.jpg"), img)
-        log.info("[save] annotated image saved: %s (target=%s, others=%d)",
-                 filepath, "OK" if success else "FAIL", len(other_objects))
+        is_fuzzy_log = (success and target_bbox is not None
+                        and bool(target_bbox.get("fuzzy", False)))
+        log.info("[save] annotated image saved: %s (target=%s%s, others=%d)",
+                 filepath,
+                 "OK" if success else "FAIL",
+                 " FUZZY" if is_fuzzy_log else "",
+                 len(other_objects))
     except Exception as e:  # noqa: BLE001
         log.warning("failed to save detection image: %s", e)
 
