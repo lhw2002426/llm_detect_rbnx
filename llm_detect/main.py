@@ -54,6 +54,13 @@ _LOG_DIR = Path(os.environ.get(
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _LOG_FILE = _LOG_DIR / "llm_detect.log"
 
+# Directory for saving annotated detection images.
+_DETECTION_IMG_DIR = Path(os.environ.get(
+    "LLM_DETECT_IMG_DIR",
+    os.path.join(Path.home(), ".llm_detect", "detections"),
+))
+_DETECTION_IMG_DIR.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=os.environ.get("LLM_DETECT_LOG_LEVEL", "INFO"),
     format="[llm_detect] %(message)s",
@@ -184,25 +191,37 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
     global _llm_client, _llm_model, _llm_temperature, _prompts, _rotation_cam2arm
 
     if _llm_client is None:
+        log.error("_call_llm_detect: LLM client is None")
         return {"success": False, "message": "LLM client not initialized"}
 
     # Rotate 180 degrees if camera is mounted opposite to arm.
     import cv2
     img = image_bgr.copy()
     if _rotation_cam2arm:
+        log.debug("rotating image 180 degrees (rotation_cam2arm=True)")
         img = cv2.rotate(img, cv2.ROTATE_180)
+
+    img_h, img_w = img.shape[:2]
+    log.info("_call_llm_detect: object='%s', image_size=%dx%d, model=%s",
+             object_name, img_w, img_h, _llm_model)
 
     # Encode image to base64 JPEG.
     _, img_encoded = cv2.imencode(".jpg", img)
     image_base64 = base64.b64encode(img_encoded.tobytes()).decode("utf-8")
+    log.debug("encoded image to base64 JPEG, length=%d chars", len(image_base64))
 
     # Build prompt from template.
     prompt_template = _prompts.get("single_detect_prompt", "")
     if not prompt_template:
+        log.error("prompt template 'single_detect_prompt' not found in loaded prompts")
         return {"success": False, "message": "prompt template 'single_detect_prompt' not found"}
     prompt = prompt_template.replace("{object_name}", object_name)
+    log.info("prompt (first 200 chars): %s", prompt[:200])
 
     # Call LLM API.
+    log.info("calling LLM API: base_url=%s, model=%s, temperature=%s",
+             _llm_client.base_url, _llm_model, _llm_temperature)
+    t_api = time.time()
     try:
         completion = _llm_client.chat.completions.create(
             model=_llm_model,
@@ -224,24 +243,39 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
             response_format={"type": "json_object"},
         )
     except Exception as e:  # noqa: BLE001
+        elapsed_api = time.time() - t_api
+        log.error("LLM API call FAILED after %.2fs: %s: %s",
+                  elapsed_api, type(e).__name__, e)
         return {"success": False, "message": f"LLM API call failed: {e}"}
 
+    elapsed_api = time.time() - t_api
+    log.info("LLM API responded in %.2fs", elapsed_api)
+
     if not completion.choices:
+        log.error("LLM returned no choices. completion=%s", completion)
         return {"success": False, "message": "LLM returned no choices"}
 
     content = completion.choices[0].message.content
     if not content:
+        log.error("LLM returned empty content. finish_reason=%s",
+                  completion.choices[0].finish_reason)
         return {"success": False, "message": "LLM returned empty content"}
+
+    log.info("LLM raw response (first 500 chars): %s", content[:500])
 
     # Parse JSON response.
     try:
         raw_json = _extract_json_from_markdown(content)
         result = json.loads(raw_json)
     except (json.JSONDecodeError, ValueError) as e:
+        log.error("JSON parse failed: %s. Raw content: %s", e, content[:1000])
         return {"success": False, "message": f"Failed to parse LLM response: {e}"}
+
+    log.info("parsed LLM result: %s", result)
 
     # Check if detection failed.
     if result.get("failed", False):
+        log.info("LLM reports object '%s' not found", object_name)
         return {
             "success": False,
             "message": f"object '{object_name}' not found by LLM",
@@ -254,16 +288,22 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
         w = float(result["box_width"])
         h = float(result["box_height"])
     except (KeyError, TypeError, ValueError) as e:
+        log.error("invalid bbox fields in LLM response: %s. result=%s", e, result)
         return {"success": False, "message": f"Invalid bbox in LLM response: {e}"}
+
+    log.info("normalized bbox: cx=%.4f cy=%.4f w=%.4f h=%.4f", cx, cy, w, h)
 
     if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0
             and 0.0 <= w <= 1.0 and 0.0 <= h <= 1.0):
+        log.error("bbox out of [0,1] range: cx=%.4f cy=%.4f w=%.4f h=%.4f",
+                  cx, cy, w, h)
         return {"success": False, "message": f"LLM bbox out of range: cx={cx}, cy={cy}, w={w}, h={h}"}
 
     # If rotation was applied, flip coordinates back.
     if _rotation_cam2arm:
         cx = 1.0 - cx
         cy = 1.0 - cy
+        log.debug("flipped coords after rotation: cx=%.4f cy=%.4f", cx, cy)
 
     return {
         "success": True,
@@ -307,12 +347,18 @@ def _detect_object(object_name: str) -> dict:
 
     # 1. LLM-based detection.
     img_h, img_w = color_img.shape[:2]
+    log.info("_detect_object: object='%s', frame_size=%dx%d", object_name, img_w, img_h)
     t0 = time.time()
     llm_result = _call_llm_detect(color_img, object_name)
     elapsed = time.time() - t0
-    log.info("LLM detection took %.2fs for '%s'", elapsed, object_name)
+    log.info("LLM detection took %.2fs for '%s', success=%s",
+             elapsed, object_name, llm_result.get("success", False))
 
     if not llm_result.get("success", False):
+        log.warning("detection failed for '%s': %s",
+                    object_name, llm_result.get("message", "unknown"))
+        # Save the raw input image even on failure for debugging.
+        _save_detection_image(color_img, object_name, None, success=False)
         return {
             "success": False,
             "message": llm_result.get("message", "LLM detection failed"),
@@ -332,14 +378,23 @@ def _detect_object(object_name: str) -> dict:
     x_max = int(min(img_w, (cx + w / 2) * img_w))
     y_max = int(min(img_h, (cy + h / 2) * img_h))
     bbox = [float(x_min), float(y_min), float(x_max), float(y_max)]
+    log.info("pixel bbox: [%d, %d, %d, %d]", x_min, y_min, x_max, y_max)
 
     # 3. 3D back-projection from depth + intrinsics.
     center_3d = _back_project_3d(bbox, depth_img, cam_info)
+    log.info("3D center: %s", center_3d)
 
     # Heuristic confidence based on bbox area ratio.
     bbox_area = (x_max - x_min) * (y_max - y_min)
     img_area = img_w * img_h
     confidence = min(1.0, max(0.5, 0.5 + 0.5 * bbox_area / img_area))
+    log.info("confidence=%.3f (bbox_area=%d, img_area=%d)",
+             confidence, bbox_area, img_area)
+
+    # 4. Save annotated image with bbox drawn.
+    _save_detection_image(color_img, object_name, bbox, success=True,
+                          class_name=llm_result.get("class_name", object_name),
+                          confidence=confidence)
 
     return {
         "success":          True,
@@ -348,6 +403,53 @@ def _detect_object(object_name: str) -> dict:
         "object_center_3d": center_3d if center_3d is not None else [],
         "confidence":       float(confidence),
     }
+
+
+def _save_detection_image(image_bgr: np.ndarray, object_name: str,
+                          bbox: "list | None", success: bool = True,
+                          class_name: str = "", confidence: float = 0.0):
+    """Save an annotated detection image to disk for debugging.
+
+    On success: draws green bbox + label.
+    On failure: saves raw image with red "FAILED" label.
+    Images are saved to ~/.llm_detect/detections/ with timestamp.
+    """
+    try:
+        import cv2
+        img = image_bgr.copy()
+        timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+
+        if success and bbox is not None:
+            x_min, y_min, x_max, y_max = [int(v) for v in bbox]
+            # Draw green bounding box.
+            cv2.rectangle(img, (x_min, y_min), (x_max, y_max),
+                          (0, 255, 0), 2)
+            # Draw label background.
+            label = f"{class_name} ({confidence:.2f})"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                          0.6, 1)
+            cv2.rectangle(img, (x_min, y_min - th - 8),
+                          (x_min + tw + 4, y_min), (0, 255, 0), -1)
+            cv2.putText(img, label, (x_min + 2, y_min - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1,
+                        cv2.LINE_AA)
+            filename = f"{timestamp_str}_{object_name}_ok.jpg"
+        else:
+            # Draw red "FAILED" text.
+            cv2.putText(img, f"FAILED: {object_name}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2,
+                        cv2.LINE_AA)
+            filename = f"{timestamp_str}_{object_name}_fail.jpg"
+
+        filepath = _DETECTION_IMG_DIR / filename
+        cv2.imwrite(str(filepath), img)
+        log.info("[save] annotated image saved: %s", filepath)
+
+        # Also save the latest detection as a fixed-name file for quick access.
+        latest_path = _DETECTION_IMG_DIR / "latest_detection.jpg"
+        cv2.imwrite(str(latest_path), img)
+    except Exception as e:  # noqa: BLE001
+        log.warning("failed to save detection image: %s", e)
 
 
 def _back_project_3d(bbox_2d, depth_img, cam_info):
@@ -519,15 +621,26 @@ def init(cfg):
     _llm_model = cfg.get("llm_model", "").strip()
     _llm_temperature = float(cfg.get("temperature", 0.0))
     _rotation_cam2arm = bool(cfg.get("rotation_cam2arm", False))
+    # API request timeout in seconds. Default 30s — much shorter than
+    # OpenAI SDK's default of 600s, so we don't hang indefinitely if the
+    # upstream API stalls.
+    llm_timeout = float(cfg.get("llm_timeout_s", 30.0))
+    llm_max_retries = int(cfg.get("llm_max_retries", 1))
 
     if not llm_base_url:
         return Err("config.llm_base_url is required (OpenAI-compatible endpoint)")
     if not _llm_model:
         return Err("config.llm_model is required (e.g. 'google/gemini-3-pro-preview')")
 
-    log.info("initializing LLM client: base_url=%s model=%s", llm_base_url, _llm_model)
+    log.info("initializing LLM client: base_url=%s model=%s temperature=%s timeout=%.1fs max_retries=%d",
+             llm_base_url, _llm_model, _llm_temperature, llm_timeout, llm_max_retries)
     try:
-        _llm_client = OpenAI(base_url=llm_base_url, api_key=llm_api_key)
+        _llm_client = OpenAI(
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+            timeout=llm_timeout,
+            max_retries=llm_max_retries,
+        )
     except Exception as e:  # noqa: BLE001
         return Err(f"Failed to create OpenAI client: {e}")
 
